@@ -14,6 +14,7 @@
 
 #include "tnn/device/cuda/acc/cuda_lstm_layer_acc.h"
 
+#include <chrono>
 #include <memory>
 
 #include "tnn/core/macro.h"
@@ -170,18 +171,12 @@ CudaLSTMONNXLayerAcc::~CudaLSTMONNXLayerAcc(){
         device_->Free(hx_);
         hx_ = nullptr;
     }
-    if (hy_) {
-        device_->Free(hy_);
-        hy_ = nullptr;
-    }
+    
     if (cx_) {
         device_->Free(cx_);
         cx_ = nullptr;
     }
-    if (cy_) {
-        device_->Free(cy_);
-        cy_ = nullptr;
-    }
+    
     if (workspace_) {
         device_->Free(workspace_);
         workspace_= nullptr;
@@ -199,6 +194,8 @@ Status CudaLSTMONNXLayerAcc::Reshape(const std::vector<Blob *> &inputs, const st
 }
 
 Status CudaLSTMONNXLayerAcc::Forward(const std::vector<Blob *> &inputs, const std::vector<Blob *> &outputs) {
+    bool use_fp16 = inputs[0]->GetBlobDesc().data_type == DATA_TYPE_HALF;
+    cudnnDataType_t cudnn_type = use_fp16 ? CUDNN_DATA_HALF : CUDNN_DATA_FLOAT;
 
     if (!this->is_reshaped) {
         DimsVector input_dims  = inputs[0]->GetBlobDesc().dims;
@@ -237,7 +234,11 @@ Status CudaLSTMONNXLayerAcc::Forward(const std::vector<Blob *> &inputs, const st
                                         bidirectional_ ? CUDNN_BIDIRECTIONAL : CUDNN_UNIDIRECTIONAL, 
                                         CUDNN_LSTM, 
                                         rnn_algo_,
-                                        CUDNN_DATA_FLOAT));
+                                        cudnn_type));
+
+        if (use_fp16) {
+            cudnnSetRNNMatrixMathType(rnn_desc_, CUDNN_TENSOR_OP_MATH);
+        }
 
         // xy initialize
         x_desc_ = (cudnnTensorDescriptor_t*)malloc(seq_length_ * sizeof(cudnnTensorDescriptor_t));
@@ -259,7 +260,7 @@ Status CudaLSTMONNXLayerAcc::Forward(const std::vector<Blob *> &inputs, const st
             strideA[1] = dimA[2];
             strideA[2] = 1;
 
-            CUDNN_CHECK(cudnnSetTensorNdDescriptor(x_desc_[i], CUDNN_DATA_FLOAT, 3, dimA, strideA));
+            CUDNN_CHECK(cudnnSetTensorNdDescriptor(x_desc_[i], cudnn_type, 3, dimA, strideA));
 
             dimA[0] = batch_size;
             dimA[1] = hidden_size_ * (bidirectional_ ? 2 : 1);
@@ -269,7 +270,7 @@ Status CudaLSTMONNXLayerAcc::Forward(const std::vector<Blob *> &inputs, const st
             strideA[1] = dimA[2];
             strideA[2] = 1;
 
-            CUDNN_CHECK(cudnnSetTensorNdDescriptor(y_desc_[i], CUDNN_DATA_FLOAT, 3, dimA, strideA));
+            CUDNN_CHECK(cudnnSetTensorNdDescriptor(y_desc_[i], cudnn_type, 3, dimA, strideA));
         }
     
     
@@ -282,16 +283,15 @@ Status CudaLSTMONNXLayerAcc::Forward(const std::vector<Blob *> &inputs, const st
         strideA[1] = dimA[2];
         strideA[2] = 1;
 
-        CUDNN_CHECK(cudnnSetTensorNdDescriptor(hx_desc_, CUDNN_DATA_FLOAT, 3, dimA, strideA));
-        CUDNN_CHECK(cudnnSetTensorNdDescriptor(cx_desc_, CUDNN_DATA_FLOAT, 3, dimA, strideA));
-        CUDNN_CHECK(cudnnSetTensorNdDescriptor(hy_desc_, CUDNN_DATA_FLOAT, 3, dimA, strideA));
-        CUDNN_CHECK(cudnnSetTensorNdDescriptor(cy_desc_, CUDNN_DATA_FLOAT, 3, dimA, strideA));
+        CUDNN_CHECK(cudnnSetTensorNdDescriptor(hx_desc_, cudnn_type, 3, dimA, strideA));
+        CUDNN_CHECK(cudnnSetTensorNdDescriptor(cx_desc_, cudnn_type, 3, dimA, strideA));
+        CUDNN_CHECK(cudnnSetTensorNdDescriptor(hy_desc_, cudnn_type, 3, dimA, strideA));
+        CUDNN_CHECK(cudnnSetTensorNdDescriptor(cy_desc_, cudnn_type, 3, dimA, strideA));
 
+        size_t uni_bytes = DataTypeUtils::GetBytesSize(inputs[0]->GetBlobDesc().data_type);
         size_t hc_size_in_bytes = (bidirectional_ ? 2 : 1) * batch_size * hidden_size_ * sizeof(float);
         RETURN_ON_NEQ(device_->ReAllocate((void **)&hx_, hc_size_in_bytes), TNN_OK);
-        RETURN_ON_NEQ(device_->ReAllocate((void **)&hy_, hc_size_in_bytes), TNN_OK);
         RETURN_ON_NEQ(device_->ReAllocate((void **)&cx_, hc_size_in_bytes), TNN_OK);
-        RETURN_ON_NEQ(device_->ReAllocate((void **)&cy_, hc_size_in_bytes), TNN_OK);
 
         CUDA_CHECK(cudaMemset(hy_, 0, hc_size_in_bytes));
         CUDA_CHECK(cudaMemset(cy_, 0, hc_size_in_bytes));
@@ -309,21 +309,25 @@ Status CudaLSTMONNXLayerAcc::Forward(const std::vector<Blob *> &inputs, const st
     
         // weight initialize
         size_t weightsSize;
-        CUDNN_CHECK(cudnnGetRNNParamsSize(context_->cudnn_handle_, rnn_desc_, x_desc_[0], &weightsSize, CUDNN_DATA_FLOAT));
+        CUDNN_CHECK(cudnnGetRNNParamsSize(context_->cudnn_handle_, rnn_desc_, x_desc_[0], &weightsSize, cudnn_type));
 
         int dimW[3];   
-        dimW[0] =  weightsSize / sizeof(float);
+        dimW[0] =  weightsSize / uni_bytes;
         dimW[1] = 1;
         dimW[2] = 1;
 
-        CUDNN_CHECK(cudnnSetFilterNdDescriptor(w_desc_, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, 3, dimW));   
+        CUDNN_CHECK(cudnnSetFilterNdDescriptor(w_desc_, cudnn_type, CUDNN_TENSOR_NCHW, 3, dimW));   
 
         RETURN_ON_NEQ(device_->ReAllocate((void **)&weights_, weightsSize), TNN_OK);
-        RETURN_ON_NEQ(PackONNXWeightsToCUDNNFormat(inputs[1], inputs[2], inputs[3], 
+        if (use_fp16) {
+            RETURN_ON_NEQ(PackONNXWeightsToCUDNNFormat(inputs[1], inputs[2], inputs[3], 
                                                 num_layers_ * (bidirectional_ ? 2 : 1), hidden_size_, input_size_,
-                                                (float*)weights_), 
-                    TNN_OK);
-
+                                                (__half*)weights_), TNN_OK);
+        } else {
+            RETURN_ON_NEQ(PackONNXWeightsToCUDNNFormat(inputs[1], inputs[2], inputs[3], 
+                                                num_layers_ * (bidirectional_ ? 2 : 1), hidden_size_, input_size_,
+                                                (float*)weights_), TNN_OK);
+        }
         CUDNN_CHECK(cudnnGetRNNWorkspaceSize(context_->cudnn_handle_, rnn_desc_, seq_length_, x_desc_, &workspace_size_));
 
         if (workspace_size_ > 0) {
@@ -333,19 +337,23 @@ Status CudaLSTMONNXLayerAcc::Forward(const std::vector<Blob *> &inputs, const st
         // set lstm algo persist plan 
         if (rnn_algo_ == CUDNN_RNN_ALGO_PERSIST_DYNAMIC) {
         // Note: This step is expensive. Once completed the plan can be reused so long as the descriptor
-        CUDNN_CHECK(cudnnCreatePersistentRNNPlan(rnn_desc_, batch_size, CUDNN_DATA_FLOAT, &rnn_plan_));
-        CUDNN_CHECK(cudnnSetPersistentRNNPlan(rnn_desc_, rnn_plan_));
+            CUDNN_CHECK(cudnnCreatePersistentRNNPlan(rnn_desc_, batch_size, cudnn_type, &rnn_plan_));
+            CUDNN_CHECK(cudnnSetPersistentRNNPlan(rnn_desc_, rnn_plan_));
         }
         this->is_reshaped = true;
     }
 
     float * bottom_data = (float*)(((char*)inputs[0]->GetHandle().base) + inputs[0]->GetHandle().bytes_offset);
     float * top_data    = (float*)(((char*)outputs[0]->GetHandle().base) + outputs[0]->GetHandle().bytes_offset);
-    CUDNN_CHECK(cudnnRNNForwardInference(context_->cudnn_handle_,
+    void * hy_data = (void*)(((char*)outputs[1]->GetHandle().base) + outputs[1]->GetHandle().bytes_offset);
+    void * cy_data = (void*)(((char*)outputs[2]->GetHandle().base) + outputs[2]->GetHandle().bytes_offset);
+    // warm up
+    for (int i = 0; i < 50; i++) {
+        CUDNN_CHECK(cudnnRNNForwardInference(context_->cudnn_handle_,
                                          rnn_desc_, 
                                          seq_length_,
                                          x_desc_, 
-                                         bottom_data, 
+                                         bottom_data,
                                          hx_desc_,
                                          hx_, 
                                          cx_desc_,
@@ -355,11 +363,43 @@ Status CudaLSTMONNXLayerAcc::Forward(const std::vector<Blob *> &inputs, const st
                                          y_desc_,
                                          top_data,
                                          hy_desc_, 
-                                         hy_,
+                                         hy_data,
                                          cy_desc_, 
-                                         cy_,
+                                         cy_data,
                                          workspace_,
                                          workspace_size_));
+    }
+    cudaDeviceSynchronize();
+
+    int numRepeats = 100;
+
+    auto start = std::chrono::steady_clock::now();
+
+    for (int i = 0; i < numRepeats; i++) {
+        CUDNN_CHECK(cudnnRNNForwardInference(context_->cudnn_handle_,
+                                         rnn_desc_, 
+                                         seq_length_,
+                                         x_desc_, 
+                                         bottom_data,
+                                         hx_desc_,
+                                         hx_, 
+                                         cx_desc_,
+                                         cx_, 
+                                         w_desc_,
+                                         weights_,
+                                         y_desc_,
+                                         top_data,
+                                         hy_desc_, 
+                                         hy_data,
+                                         cy_desc_, 
+                                         cy_data,
+                                         workspace_,
+                                         workspace_size_));
+        cudaDeviceSynchronize();
+    }
+    auto end = std::chrono::steady_clock::now();
+    auto forward_time = std::chrono::duration<double, std::micro>(end - start).count() / numRepeats;
+    printf("lstm forward time: %d us\n", (int)forward_time);
     return TNN_OK;
 }
 

@@ -99,17 +99,17 @@ namespace test {
             auto output_params_map = CreateConvertParamMap(output_mat_map, false);
 
             for (int i = 0; i < FLAGS_wc; ++i) {
-                for(auto element : input_converters_map) {
+                /*for(auto element : input_converters_map) {
                     auto name = element.first;
                     auto blob_converter = element.second;
                     blob_converter->ConvertFromMatAsync(*input_mat_map[name], input_params_map[name], command_queue);
-                }
-                ret = instance->ForwardAsync(nullptr);
-                for(auto element : output_converters_map) {
+                }*/
+                ret = instance->Forward();
+                /*for(auto element : output_converters_map) {
                     auto name = element.first;
                     auto blob_converter = element.second;
                     blob_converter->ConvertToMat(*output_mat_map[name], output_params_map[name], command_queue);
-                }
+                }*/
             }
 #if TNN_PROFILE
             instance->StartProfile();
@@ -124,30 +124,30 @@ namespace test {
 
             for (int i = 0; i < FLAGS_ic; ++i) {
                 timer.Start();
-                for(auto element : input_converters_map) {
+                /*for(auto element : input_converters_map) {
                     auto name = element.first;
                     auto blob_converter = element.second;
                     ret = blob_converter->ConvertFromMatAsync(*input_mat_map[name], input_params_map[name], command_queue);
                     if (!CheckResult("ConvertFromMat", ret)) {
                         return ret;
                     }
-                }
-#if (DUMP_INPUT_BLOB || DUMP_OUTPUT_BLOB)
+                }*/
+//#if (DUMP_INPUT_BLOB || DUMP_OUTPUT_BLOB)
                 ret = instance->Forward();
-#else
-                ret = instance->ForwardAsync(nullptr);
-#endif
+//#else
+//                ret = instance->ForwardAsync(nullptr);
+//#endif
                 if (!CheckResult("Forward", ret)) {
                     return ret;
                 }
-                for(auto element : output_converters_map) {
+                /*for(auto element : output_converters_map) {
                     auto name = element.first;
                     auto blob_converter = element.second;
                     ret = blob_converter->ConvertToMat(*output_mat_map[name], output_params_map[name], command_queue);
                     if (!CheckResult("ConvertToMat", ret)) {
                         return ret;
                     }
-                }
+                }*/
                 timer.Stop();
             }
 #if TNN_PROFILE
